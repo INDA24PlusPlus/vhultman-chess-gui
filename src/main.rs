@@ -76,7 +76,7 @@ fn main() {
             move_selector.moves = board.get_moves();
         }
 
-        if game_state == GameState::Checkmate {
+        if game_state == GameState::Checkmate || game_state == GameState::Draw {
             if let Some(restart) = Menu::update(&mut rl) {
                 if restart {
                     board = ChessBoard::new();
