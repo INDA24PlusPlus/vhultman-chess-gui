@@ -44,7 +44,6 @@ fn main() {
     ];
 
     let mut board = ChessBoard::new();
-    let mut game_state = GameState::InProgress;
     board.board = vec![initial_board];
 
     let mut move_selector = MoveSelector {
@@ -55,7 +54,7 @@ fn main() {
     };
 
     while !rl.window_should_close() {
-        game_state = board.current_gamestate();
+        let game_state = board.current_gamestate();
 
         if let Some(m) = move_selector.on_update(&mut rl) {
             let to = move_squares(&m).1;
