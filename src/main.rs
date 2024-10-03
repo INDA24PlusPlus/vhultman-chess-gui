@@ -1,5 +1,5 @@
 use chess::*;
-use chess_networking::{Move, Start};
+use chess_networking::{Ack, Move, PromotionPiece, Start};
 use network::*;
 use raylib::prelude::*;
 
@@ -36,16 +36,17 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     let is_server = args[1] == "server";
+    let address = &args[2];
+
     let mut network: Box<dyn ChessProtocol> = if is_server {
-        Box::new(Server::new().unwrap())
+        Box::new(Server::new(address).unwrap())
     } else {
-        Box::new(Client::new().unwrap())
+        Box::new(Client::new(address).unwrap())
     };
 
-    let our_name = &args[1];
     let desired_start = Start {
         is_white: is_server,
-        name: our_name.to_string(),
+        name: None,
         fen: None,
         time: None,
         inc: None,
@@ -53,8 +54,7 @@ fn main() {
 
     let start = network.handle_setup(desired_start).unwrap();
     let mut our_turn = start.is_white == false;
-    println!("{:?}", start);
-    network.set_blocking(false);
+    network.set_blocking(false).unwrap();
 
     let initial_board: [[char; 8]; 8] = [
         ['r', 'n', 'b', 'q', 'k', 'b', 'n', 'r'],
@@ -77,20 +77,74 @@ fn main() {
         promotion_move: None,
     };
 
+    let mut awaiting_ack = false;
+
     while !rl.window_should_close() {
-        let game_state = board.current_gamestate();
-        if let Some(m) = network.receive_move().unwrap() {
-            println!("{:?}", m);
-            let mut move_str = String::new();
+        let mut game_state = board.current_gamestate();
 
-            move_str.push(('a' as u8 + m.from.0 as u8) as char);
-            move_str.push(('8' as u8 - m.from.1 as u8) as char);
-            move_str.push(('a' as u8 + m.to.0 as u8) as char);
-            move_str.push(('8' as u8 - m.to.1 as u8) as char);
+        if awaiting_ack {
+            if let Some(ack) = network.receive_ack().unwrap() {
+                println!("{ack:?}");
+                awaiting_ack = false;
 
-            board.make_move(move_str);
-            move_selector.moves = board.get_moves();
-            our_turn = !our_turn;
+                if !ack.ok {
+                    board.undo_move();
+                    move_selector.moves = board.get_moves();
+                    our_turn = !our_turn;
+                }
+            }
+        } else {
+            if let Some(m) = network.receive_move().unwrap() {
+                println!("{m:?}");
+                let mut move_str = String::new();
+
+                move_str.push(('a' as u8 + m.from.0 as u8) as char);
+                move_str.push(('1' as u8 + m.from.1 as u8) as char);
+                move_str.push(('a' as u8 + m.to.0 as u8) as char);
+                move_str.push(('1' as u8 + m.to.1 as u8) as char);
+
+                if let Some(promotion_piece) = m.promotion {
+                    move_str.push(match promotion_piece {
+                        PromotionPiece::Queen => 'q',
+                        PromotionPiece::Rook => 'r',
+                        PromotionPiece::Bishop => 'b',
+                        PromotionPiece::Knight => 'n',
+                    });
+                }
+
+                // Our chess library needs a 'e' appended if the move is en passant.
+                let from_square = ((7 - m.from.1) * 8 + m.from.0) as u32;
+                let to_squqare = ((7 - m.to.1) * 8 + m.to.0) as u32;
+                let moving_piece = board.piece_on(from_square).unwrap(); // Why no implicit upcasting rust?
+                let target_piece = board.piece_on(to_squqare);
+
+                if moving_piece.t == PieceType::Pawn && target_piece.is_none() {
+                    let diff = (from_square as i32 - to_squqare as i32).abs();
+                    if diff != 8 && diff != 16 {
+                        move_str.push('e');
+                    }
+                }
+
+                let is_legal_move = move_selector.moves.iter().any(|s| *s == move_str);
+
+                if is_legal_move {
+                    board.make_move(move_str);
+                    game_state = board.current_gamestate();
+                    move_selector.moves = board.get_moves();
+                    our_turn = !our_turn;
+                }
+
+                network
+                    .send_ack(Ack {
+                        ok: is_legal_move,
+                        end_state: match game_state {
+                            GameState::Draw => Some(chess_networking::GameState::Draw),
+                            GameState::Checkmate => Some(chess_networking::GameState::CheckMate),
+                            GameState::InProgress => None,
+                        },
+                    })
+                    .unwrap();
+            }
         }
 
         if our_turn {
@@ -112,15 +166,26 @@ fn main() {
 
                 network
                     .send_move(Move {
-                        from: (from as u8 & 7, from as u8 / 8),
-                        to: (to as u8 & 7, to as u8 / 8),
-                        promotion: None,
+                        from: (from as u8 & 7, 7 - from as u8 / 8),
+                        to: (to as u8 & 7, 7 - to as u8 / 8),
+                        promotion: if is_promotion {
+                            Some(match m.chars().nth(4).unwrap() {
+                                'q' => PromotionPiece::Queen,
+                                'r' => PromotionPiece::Rook,
+                                'b' => PromotionPiece::Bishop,
+                                'n' => PromotionPiece::Knight,
+                                _ => unreachable!(),
+                            })
+                        } else {
+                            None
+                        },
                         forfeit: false,
-                        ofer_draw: false,
+                        offer_draw: false,
                     })
                     .unwrap();
 
                 board.make_move(m);
+                awaiting_ack = true;
                 move_selector.moves = board.get_moves();
                 our_turn = !our_turn;
             }
@@ -159,15 +224,6 @@ fn main() {
             GameState::Checkmate => Menu::draw(&mut d, &board, &textures, "Checkmate"),
             GameState::Draw => Menu::draw(&mut d, &board, &textures, "Draw"),
         };
-
-        d.draw_text(&our_name, 10, 10, 48, Color::CORNFLOWERBLUE);
-        d.draw_text(
-            &start.name,
-            10,
-            WINDOW_HEIGHT - 10 - 48,
-            48,
-            Color::CORNFLOWERBLUE,
-        );
     }
 }
 
@@ -584,10 +640,7 @@ impl Piece {
             'q' => PieceType::Queen,
             'k' => PieceType::King,
             '.' => return None,
-            _ => {
-                println!("Should panic");
-                return None;
-            }
+            _ => unreachable!(),
         };
 
         Some(Piece {
