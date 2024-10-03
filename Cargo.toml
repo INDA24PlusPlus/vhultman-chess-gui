@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 raylib = { version = "5.0" }
 chess = { git = "https://github.com/INDA24PlusPlus/tbeskow-chess" }
+chess-networking = { git = "https://github.com/INDA24PlusPlus/chess-networking" }

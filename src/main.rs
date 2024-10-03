@@ -1,5 +1,9 @@
 use chess::*;
+use chess_networking::{Move, Start};
+use network::*;
 use raylib::prelude::*;
+
+mod network;
 
 const WINDOW_WIDTH: i32 = 1024;
 const WINDOW_HEIGHT: i32 = 1024;
@@ -26,11 +30,31 @@ fn main() {
 
     let move_sound = audio.new_sound("assets/move-self.mp3").unwrap();
     let capture_sound = audio.new_sound("assets/capture.mp3").unwrap();
-    let check_sound = audio.new_sound("assets/capture.mp3").unwrap();
     let promote_sound = audio.new_sound("assets/move-check.mp3").unwrap();
-    let castle_sound = audio.new_sound("assets/castle.mp3").unwrap();
 
     let textures = load_textures(&mut rl, &thread);
+    let args: Vec<String> = std::env::args().collect();
+
+    let is_server = args[1] == "server";
+    let mut network: Box<dyn ChessProtocol> = if is_server {
+        Box::new(Server::new().unwrap())
+    } else {
+        Box::new(Client::new().unwrap())
+    };
+
+    let our_name = &args[1];
+    let desired_start = Start {
+        is_white: is_server,
+        name: our_name.to_string(),
+        fen: None,
+        time: None,
+        inc: None,
+    };
+
+    let start = network.handle_setup(desired_start).unwrap();
+    let mut our_turn = start.is_white == false;
+    println!("{:?}", start);
+    network.set_blocking(false);
 
     let initial_board: [[char; 8]; 8] = [
         ['r', 'n', 'b', 'q', 'k', 'b', 'n', 'r'],
@@ -55,34 +79,61 @@ fn main() {
 
     while !rl.window_should_close() {
         let game_state = board.current_gamestate();
+        if let Some(m) = network.receive_move().unwrap() {
+            println!("{:?}", m);
+            let mut move_str = String::new();
 
-        if let Some(m) = move_selector.on_update(&mut rl) {
-            let to = move_squares(&m).1;
-            let is_capture = board.piece_on(to).is_some();
-            let is_promotion = is_promotion(&m);
-            let is_quiet = !is_capture && !is_promotion;
+            move_str.push(('a' as u8 + m.from.0 as u8) as char);
+            move_str.push(('8' as u8 - m.from.1 as u8) as char);
+            move_str.push(('a' as u8 + m.to.0 as u8) as char);
+            move_str.push(('8' as u8 - m.to.1 as u8) as char);
 
-            if is_capture {
-                capture_sound.play();
-            }
-            if is_promotion {
-                promote_sound.play();
-            }
-            if is_quiet {
-                move_sound.play();
-            }
-            board.make_move(m);
+            board.make_move(move_str);
             move_selector.moves = board.get_moves();
+            our_turn = !our_turn;
         }
 
-        if game_state == GameState::Checkmate || game_state == GameState::Draw {
-            if let Some(restart) = Menu::update(&mut rl) {
-                if restart {
-                    board = ChessBoard::new();
-                    board.board = vec![initial_board];
-                    move_selector.moves = board.get_moves();
-                } else {
-                    break;
+        if our_turn {
+            if let Some(m) = move_selector.on_update(&mut rl) {
+                let (from, to) = move_squares(&m);
+                let is_capture = board.piece_on(to).is_some();
+                let is_promotion = is_promotion(&m);
+                let is_quiet = !is_capture && !is_promotion;
+
+                if is_capture {
+                    capture_sound.play();
+                }
+                if is_promotion {
+                    promote_sound.play();
+                }
+                if is_quiet {
+                    move_sound.play();
+                }
+
+                network
+                    .send_move(Move {
+                        from: (from as u8 & 7, from as u8 / 8),
+                        to: (to as u8 & 7, to as u8 / 8),
+                        promotion: None,
+                        forfeit: false,
+                        ofer_draw: false,
+                    })
+                    .unwrap();
+
+                board.make_move(m);
+                move_selector.moves = board.get_moves();
+                our_turn = !our_turn;
+            }
+
+            if game_state == GameState::Checkmate || game_state == GameState::Draw {
+                if let Some(restart) = Menu::update(&mut rl) {
+                    if restart {
+                        board = ChessBoard::new();
+                        board.board = vec![initial_board];
+                        move_selector.moves = board.get_moves();
+                    } else {
+                        break;
+                    }
                 }
             }
         }
@@ -90,7 +141,6 @@ fn main() {
         let mut d = rl.begin_drawing(&thread);
 
         draw_board(&mut d);
-
         match game_state {
             GameState::InProgress => {
                 if let Some(s) = move_selector.selected_square {
@@ -109,6 +159,15 @@ fn main() {
             GameState::Checkmate => Menu::draw(&mut d, &board, &textures, "Checkmate"),
             GameState::Draw => Menu::draw(&mut d, &board, &textures, "Draw"),
         };
+
+        d.draw_text(&our_name, 10, 10, 48, Color::CORNFLOWERBLUE);
+        d.draw_text(
+            &start.name,
+            10,
+            WINDOW_HEIGHT - 10 - 48,
+            48,
+            Color::CORNFLOWERBLUE,
+        );
     }
 }
 
@@ -327,7 +386,7 @@ impl PromotionUI {
         None
     }
 
-    fn draw(&self, d: &mut RaylibDrawHandle, textures: &[Texture2D], color: ChessColor) {
+    fn draw(&self, d: &mut impl RaylibDraw, textures: &[Texture2D], color: ChessColor) {
         d.draw_rectangle_rounded(
             Rectangle::new(self.x, self.y, Self::WIDTH, Self::HEIGHT),
             0.5,
@@ -369,7 +428,7 @@ fn square(s: &str) -> u32 {
     y0 * 8 + x0
 }
 
-fn hightlight_current_piece(d: &mut RaylibDrawHandle, board: &ChessBoard, square: u32) {
+fn hightlight_current_piece(d: &mut impl RaylibDraw, board: &ChessBoard, square: u32) {
     let color = if board.current_side() == ChessColor::White {
         Color::get_color(COLOR_WHITE_SELECTED)
     } else {
@@ -388,7 +447,7 @@ fn hightlight_current_piece(d: &mut RaylibDrawHandle, board: &ChessBoard, square
     );
 }
 
-fn highlight_movable_squares(d: &mut RaylibDrawHandle, moves: &[String], selected_square: u32) {
+fn highlight_movable_squares(d: &mut impl RaylibDraw, moves: &[String], selected_square: u32) {
     for m in moves {
         let (from, to) = move_squares(m);
         if from == selected_square {
@@ -402,7 +461,7 @@ fn highlight_movable_squares(d: &mut RaylibDrawHandle, moves: &[String], selecte
     }
 }
 
-fn draw_pieces(d: &mut RaylibDrawHandle, board: &ChessBoard, textures: &[Texture2D]) {
+fn draw_pieces(d: &mut impl RaylibDraw, board: &ChessBoard, textures: &[Texture2D]) {
     for y in 0..8 {
         for x in 0..8 {
             let curr_piece = board.board[board.board.len() - 1][y][x];
@@ -437,7 +496,7 @@ fn draw_pieces(d: &mut RaylibDrawHandle, board: &ChessBoard, textures: &[Texture
     }
 }
 
-fn draw_board(d: &mut RaylibDrawHandle) {
+fn draw_board(d: &mut impl RaylibDraw) {
     for y in 0..8 {
         for x in 0..8 {
             let color = if (x + y) % 2 == 0 {
